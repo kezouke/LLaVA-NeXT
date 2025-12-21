@@ -30,7 +30,7 @@ train = [
     "fastapi",
     "gradio==3.35.2",
     "markdown2[all]",
-    "numpy",
+    "numpy<2",
     "requests",
     "sentencepiece",
     "torch==2.1.2",

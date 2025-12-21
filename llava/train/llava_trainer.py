@@ -247,10 +247,19 @@ class LLaVATrainer(Trainer):
         accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
         rank0_print("Setting NCCL timeout to INF to avoid running errors.")
 
-        # create accelerator object
-        self.accelerator = Accelerator(
-            dispatch_batches=self.args.dispatch_batches, split_batches=self.args.split_batches, deepspeed_plugin=self.args.deepspeed_plugin, gradient_accumulation_plugin=gradient_accumulation_plugin, kwargs_handlers=[accelerator_kwargs]
-        )
+        # create accelerator object (compatible across accelerate versions)
+        try:
+            self.accelerator = Accelerator(
+                deepspeed_plugin=getattr(self.args, "deepspeed_plugin", None),
+                gradient_accumulation_plugin=gradient_accumulation_plugin,
+                kwargs_handlers=[accelerator_kwargs],
+            )
+        except TypeError:
+            # Fallback for older accelerate versions without deepspeed_plugin kwarg
+            self.accelerator = Accelerator(
+                gradient_accumulation_plugin=gradient_accumulation_plugin,
+                kwargs_handlers=[accelerator_kwargs],
+            )
         # some Trainer classes need to use `gather` instead of `gather_for_metrics`, thus we store a flag
         self.gather_function = self.accelerator.gather_for_metrics
 

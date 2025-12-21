@@ -87,6 +87,8 @@ class LlavaMetaModel:
 
         self.config.use_mm_proj = True
         self.config.mm_projector_type = getattr(model_args, "mm_projector_type", "linear")
+        # Propagate desired low-rank to config so builder can pick it up
+        self.config.mm_low_rank_rank = getattr(model_args, "mm_low_rank_rank", getattr(self.config, "mm_low_rank_rank", 64))
         self.config.mm_hidden_size = getattr(vision_resampler, "hidden_size", vision_tower.hidden_size)
         self.config.mm_vision_select_layer = mm_vision_select_layer
         self.config.mm_vision_select_feature = mm_vision_select_feature
@@ -99,6 +101,18 @@ class LlavaMetaModel:
                 embed_std = 1 / torch.sqrt(torch.tensor(self.config.hidden_size, dtype=self.dtype))
                 self.image_newline = nn.Parameter(torch.randn(self.config.hidden_size, dtype=self.dtype) * embed_std)
         else:
+            # If an existing projector rank mismatches the requested rank, rebuild it
+            rebuild = False
+            try:
+                existing_rank = getattr(self.mm_projector, "rank", None)
+                target_rank = getattr(self.config, "mm_low_rank_rank", None)
+                if self.config.mm_projector_type == "low_rank" and (existing_rank is not None) and (target_rank is not None) and (existing_rank != target_rank):
+                    rebuild = True
+            except Exception:
+                rebuild = False
+            if rebuild:
+                self.mm_projector = build_vision_projector(self.config, vision_cfg=vision_tower.config)
+
             # In case it is frozen by LoRA
             for p in self.mm_projector.parameters():
                 p.requires_grad = True

@@ -1584,8 +1584,15 @@ def train(attn_implementation=None):
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
+    # Resume only if a proper trainer_state.json exists in the latest checkpoint.
+    checkpoints = sorted(
+        pathlib.Path(training_args.output_dir).glob("checkpoint-*"),
+        key=lambda p: int(p.name.split("-")[-1]) if p.name.split("-")[-1].isdigit() else -1,
+    )
+    resume_ckpt = checkpoints[-1] if len(checkpoints) > 0 else None
+    trainer_state_file = "trainer_state.json"
+    if resume_ckpt is not None and (resume_ckpt / trainer_state_file).exists():
+        trainer.train(resume_from_checkpoint=str(resume_ckpt))
     else:
         trainer.train()
     trainer.save_state()

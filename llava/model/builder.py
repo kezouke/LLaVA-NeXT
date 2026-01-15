@@ -134,23 +134,47 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             ):
                 from llava.model.language_model.llava_llama import LlavaConfig
 
-                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+                # tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
                 if customized_config is None:
                     llava_cfg = LlavaConfig.from_pretrained(model_path)
+                    # Always delay load to avoid loading vision tower in init_empty_weights context
+                    # This prevents the vision tower from being initialized on meta device without weights
+                    llava_cfg.delay_load = True
                     if "v1.5" in model_name.lower():
                         llava_cfg.delay_load = True  # a workaround for correctly loading v1.5 models
                 else:
                     llava_cfg = customized_config
 
                 tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-                llava_cfg = LlavaConfig.from_pretrained(model_path)
+                
+                # Reset vocab size to base model's size to avoid mismatch during loading
+                # The checkpoint config has the resized vocab size (e.g. 128257), but the base model weights have original size (e.g. 128256)
+                base_config = AutoConfig.from_pretrained(model_base)
+                llava_cfg.vocab_size = base_config.vocab_size
+
                 model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=llava_cfg, **kwargs)
             else:
                 raise ValueError(f"Model {model_name} not supported")
 
             mm_projector_weights = torch.load(os.path.join(model_path, "mm_projector.bin"), map_location="cpu")
             mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
-            model.load_state_dict(mm_projector_weights, strict=False)
+            
+            # Resize embeddings if necessary before loading weights
+            if "model.embed_tokens.weight" in mm_projector_weights:
+                new_vocab_size = mm_projector_weights["model.embed_tokens.weight"].shape[0]
+                if model.model.embed_tokens.weight.shape[0] != new_vocab_size:
+                    # Add special tokens to tokenizer to match the new size
+                    # We assume the extra tokens are the standard LLaVA ones
+                    mm_use_im_patch_token = getattr(model.config, "mm_use_im_patch_token", True)
+                    if mm_use_im_patch_token:
+                        tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
+                    # If still not matching, we might need start/end tokens or just resize blindly
+                    if len(tokenizer) != new_vocab_size:
+                         model.resize_token_embeddings(new_vocab_size)
+                    else:
+                         model.resize_token_embeddings(len(tokenizer))
+
+            model.load_state_dict(mm_projector_weights, strict=False, assign=True)
         else:
             rank0_print(f"Loaded LLaVA model: {model_path}")
             if "mixtral" in model_name.lower():

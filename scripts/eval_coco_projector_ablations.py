@@ -21,7 +21,10 @@ DEFAULT_CHECKPOINT_ROOT = "./checkpoints"
 DEFAULT_PROJECTORS = ["linear", "mlp2x", "mlp2x-res2x", "pooler"]
 
 def get_checkpoint_path(checkpoint_root, projector_slug, tag):
-    model_dir_name = f"llava-{projector_slug}-{tag}"
+    if tag:
+        model_dir_name = f"llava-{projector_slug}-{tag}"
+    else:
+        model_dir_name = f"llava-{projector_slug}"
     model_dir = os.path.join(checkpoint_root, model_dir_name)
     
     if not os.path.exists(model_dir):
@@ -181,6 +184,8 @@ def run_inference(args, projector):
             missing, unexpected = model.load_state_dict(mm_projector_weights, strict=False, assign=True)
             print(f"Reloaded projector. Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
             model.get_model().mm_projector.to(device)
+            if hasattr(model.get_model(), 'vision_resampler'):
+                model.get_model().vision_resampler.to(device)
         else:
             print(f"Warning: mm_projector.bin not found at {mm_projector_path}")
 
@@ -194,8 +199,16 @@ def run_inference(args, projector):
 
         results = []
         
-        # Prepare prompt
-        prompt = DEFAULT_IMAGE_TOKEN + "\nPlease describe this image in one sentence."
+        # Prepare prompt -- use conversation template if specified
+        conv_template = getattr(args, "conv_template", None)
+        if conv_template and conv_template in conv_templates:
+            conv = conv_templates[conv_template].copy()
+            conv.tokenizer = tokenizer
+            conv.append_message(conv.roles[0], DEFAULT_IMAGE_TOKEN + "\nPlease describe this image in one sentence.")
+            conv.append_message(conv.roles[1], None)
+            prompt = conv.get_prompt()
+        else:
+            prompt = DEFAULT_IMAGE_TOKEN + "\nPlease describe this image in one sentence."
         input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(device)
 
         for img_info in tqdm(images, desc="Inference"):
@@ -226,7 +239,9 @@ def run_inference(args, projector):
                         pad_token_id=tokenizer.eos_token_id
                     )
 
-                output = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
+                # Use _prompt_length_for_generate if available (handles image token expansion)
+                prompt_len = getattr(model, "_prompt_length_for_generate", input_ids.shape[1])
+                output = tokenizer.decode(output_ids[0, prompt_len:], skip_special_tokens=True).strip()
                 caption = extract_caption(output)
                 
                 results.append({
@@ -284,6 +299,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./results", help="Directory to save results")
     parser.add_argument("--max_samples", type=int, help="Limit number of samples for debugging")
     parser.add_argument("--do_eval", action="store_true", help="Run evaluation after inference (requires annotation_file)")
+    parser.add_argument("--conv_template", type=str, default=None, help="Conversation template (e.g., llava_llama_3). If not set, uses plain prompt.")
     
     # Internal argument for subprocess
     parser.add_argument("--run_projector", type=str, help="Internal: run specific projector")
@@ -314,6 +330,8 @@ def main():
                 cmd.extend(["--max_samples", str(args.max_samples)])
             if args.do_eval:
                 cmd.append("--do_eval")
+            if args.conv_template:
+                cmd.extend(["--conv_template", args.conv_template])
             
             # Add the specific projector to run
             cmd.extend(["--run_projector", proj])

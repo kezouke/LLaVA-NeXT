@@ -66,6 +66,11 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     def get_model(self):
         return self.model
 
+    def load_state_dict(self, state_dict, strict=True, **kwargs):
+        # Strip legacy aux_head keys from old checkpoints (now we use aux_proj/aux_rproj)
+        state_dict = {k: v for k, v in state_dict.items() if "vision_resampler.aux_head." not in k}
+        return super().load_state_dict(state_dict, strict=strict, **kwargs)
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -84,6 +89,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         dpo_forward: Optional[bool] = None,
         cache_position=None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        
+        # Reset auxiliary loss at the start of forward pass
+        self.model.aux_loss = None
 
         if inputs_embeds is None:
             (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes)
@@ -106,7 +114,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             return logits, labels
 
         else:
-            return super().forward(
+            output = super().forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -118,6 +126,18 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
             )
+            # Add Q-Former auxiliary correlation loss if present (anti-collapse)
+            if getattr(self.model, "aux_loss", None) is not None:
+                aux_weight = getattr(self.config, "mm_qformer_aux_loss_weight", 0.05)
+                if output.loss is not None:
+                    output = CausalLMOutputWithPast(
+                        loss=output.loss + aux_weight * self.model.aux_loss,
+                        logits=output.logits,
+                        past_key_values=output.past_key_values,
+                        hidden_states=output.hidden_states,
+                        attentions=output.attentions,
+                    )
+            return output
 
     @torch.no_grad()
     def generate(
@@ -134,11 +154,23 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             raise NotImplementedError("`inputs_embeds` is not supported")
 
         if images is not None:
-            (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes)
+            (_, position_ids, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes)
+            # Generation loop expects input_ids to have the same sequence length as inputs_embeds (text + image tokens).
+            # Otherwise prepare_inputs_for_generation slices input_ids[:, past_length:] and gets empty after step 1.
+            seq_len = inputs_embeds.shape[1]
+            batch_size = inputs_embeds.shape[0]
+            device = inputs_embeds.device
+            dtype = inputs.dtype if inputs is not None else torch.long
+            pad_id = self.config.pad_token_id if self.config.pad_token_id is not None else 0
+            input_ids_for_generate = torch.full((batch_size, seq_len), pad_id, device=device, dtype=dtype)
+            # So inference scripts can slice output_ids correctly (prompt length != len(text tokens)).
+            self._prompt_length_for_generate = seq_len
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
+            input_ids_for_generate = inputs
+            self._prompt_length_for_generate = inputs.shape[1]
 
-        return super().generate(position_ids=position_ids, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs)
+        return super().generate(input_ids_for_generate, position_ids=position_ids, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs)
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
         images = kwargs.pop("images", None)

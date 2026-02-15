@@ -1107,16 +1107,48 @@ class Qformer(nn.Module):
         self.num_latents = model_args.mm_qformer_latents
         self.pretrained = model_args.mm_qformer_pretrained
 
-        self.Qformer, self.query_tokens, self.ln_vision = self.build_Qformer(vision_tower.hidden_size, self.depth, self.num_latents)
+        self.cross_attention_freq = getattr(model_args, "mm_qformer_cross_attention_freq", 1)
+        self.Qformer, self.query_tokens, self.ln_vision = self.build_Qformer(vision_tower.hidden_size, self.cross_attention_freq, self.num_latents)
+
+        # Auxiliary Loss Components (Barlow Twins style)
+        self.use_aux_loss = getattr(model_args, "mm_qformer_use_aux_loss", False)
+        if self.use_aux_loss:
+            self.aux_dim = getattr(model_args, "mm_qformer_aux_dim", 256)
+            self.aux_alpha = getattr(model_args, "mm_qformer_aux_alpha", 5e-3)
+            
+            # Trainable projection for Q-Former output
+            self.aux_proj = nn.Linear(self.hidden_size, self.aux_dim, bias=False)
+            
+            # Fixed random projection for Vision Tower output
+            # Registered as buffer so it's saved but not trained
+            aux_rproj = torch.randn(vision_tower.hidden_size, self.aux_dim) / (vision_tower.hidden_size ** 0.5)
+            self.register_buffer("aux_rproj", aux_rproj)
+            
+            # LayerNorms (no affine parameters)
+            self.aux_ln = nn.LayerNorm(self.aux_dim, elementwise_affine=False)
+            
+            # Batch accumulation buffers for single-GPU stability
+            self.aux_batch_accum = getattr(model_args, "mm_aux_batch_accum", 32)
+            self.register_buffer("aux_zq_buf", torch.zeros(0, self.aux_dim))
+            self.register_buffer("aux_zv_buf", torch.zeros(0, self.aux_dim))
 
         if self.pretrained is not None:
             pretrained_dict = torch.load(self.pretrained, map_location="cpu")["model"]
             pretrained_dict = {k: v for k, v in pretrained_dict.items() if not k.startswith("t5_proj")}
             self.load_state_dict(pretrained_dict)
 
+    def load_state_dict(self, state_dict, strict=True, **kwargs):
+        """Load state dict with compatibility for legacy 'aux_head' checkpoints (drop aux_head keys)."""
+        state_dict = dict(state_dict)
+        # Legacy checkpoints used aux_head (different shape); drop so we don't get unexpected_keys (aux_proj/aux_rproj stay init)
+        state_dict.pop("aux_head.weight", None)
+        state_dict.pop("aux_head.bias", None)
+        return super().load_state_dict(state_dict, strict=strict, **kwargs)
+
     def build_Qformer(self, vision_width, cross_attention_freq, num_query_token):
         encoder_config = BertConfig.from_pretrained("bert-base-uncased")
         encoder_config.encoder_width = vision_width
+        encoder_config.num_hidden_layers = self.depth
         # insert cross-attention layer every other block
         encoder_config.add_cross_attention = True
         encoder_config.cross_attention_freq = cross_attention_freq
@@ -1133,10 +1165,20 @@ class Qformer(nn.Module):
         return Qformer, query_tokens, nn.LayerNorm(vision_width)
 
     def forward(self, image_features, *args, **kwargs):
+        # DEBUG: Check inputs
+        if torch.isnan(image_features).any():
+            print("CRITICAL: QFormer input image_features has NaNs!")
+        
         x = self.ln_vision(image_features)
+        if torch.isnan(x).any():
+            print("CRITICAL: QFormer ln_vision output has NaNs!")
+
         image_atts = torch.ones(x.size()[:-1], dtype=torch.long).to(x.device)
 
         query_tokens = self.query_tokens.expand(x.shape[0], -1, -1)
+        if torch.isnan(query_tokens).any():
+            print("CRITICAL: QFormer query_tokens has NaNs!")
+
         query_output = self.Qformer.bert(
             query_embeds=query_tokens,
             encoder_hidden_states=x,
@@ -1144,7 +1186,52 @@ class Qformer(nn.Module):
             return_dict=True,
         )
 
-        return query_output.last_hidden_state
+        q_hidden = query_output.last_hidden_state
+        if torch.isnan(q_hidden).any():
+            print("CRITICAL: QFormer output q_hidden has NaNs!")
+
+        if getattr(self, "use_aux_loss", False) and self.training:
+            # Correlation-based Auxiliary Loss (Barlow Twins) with batch accumulation
+            # Force FP32 for numerical stability
+            with torch.cuda.amp.autocast(enabled=False):
+                # 1. Compute Means (Global Pooling)
+                q_mean = q_hidden.float().mean(dim=1)  # [B, 768]
+                v_mean = image_features.float().mean(dim=1)  # [B, 1024]
+                
+                # 2. Project to Latent Space (current batch, with gradients)
+                z_q = self.aux_ln(self.aux_proj(q_mean))  # [B, aux_dim]
+                z_v = self.aux_ln(v_mean @ self.aux_rproj.float())  # [B, aux_dim]
+                
+                # 3. Accumulate detached copies into buffers
+                self.aux_zq_buf = torch.cat([self.aux_zq_buf, z_q.detach()], dim=0)
+                self.aux_zv_buf = torch.cat([self.aux_zv_buf, z_v.detach()], dim=0)
+                
+                # 4. Compute loss only when buffer is full
+                if self.aux_zq_buf.size(0) >= self.aux_batch_accum:
+                    # Build full buffer: previous (detached) + current (with grad)
+                    # Replace the last B entries with grad-enabled current batch
+                    B = z_q.size(0)
+                    buf_zq = torch.cat([self.aux_zq_buf[:-B], z_q], dim=0)
+                    buf_zv = torch.cat([self.aux_zv_buf[:-B], z_v], dim=0)
+                    B_eff = buf_zq.size(0)
+                    
+                    # Cross-Correlation Matrix
+                    c = (buf_zq.T @ buf_zv) / B_eff  # [aux_dim, aux_dim]
+                    
+                    # Loss
+                    on_diag = torch.diagonal(c).add(-1).pow(2).sum()
+                    off_diag = (c - torch.diag(torch.diagonal(c))).pow(2).sum()
+                    aux_loss = (on_diag + self.aux_alpha * off_diag) / self.aux_dim
+                    
+                    # Reset buffers
+                    self.aux_zq_buf = torch.zeros(0, self.aux_dim, device=q_hidden.device)
+                    self.aux_zv_buf = torch.zeros(0, self.aux_dim, device=q_hidden.device)
+                else:
+                    aux_loss = torch.zeros((), device=q_hidden.device)
+                
+            return q_hidden, aux_loss
+            
+        return q_hidden
 
     @property
     def hidden_size(self):
@@ -1157,4 +1244,5 @@ class Qformer(nn.Module):
             "mm_qformer_depth": self.depth,
             "mm_qformer_latents": self.num_latents,
             "mm_qformer_pretrained": self.pretrained,
+            "mm_qformer_cross_attention_freq": self.cross_attention_freq,
         }

@@ -100,7 +100,14 @@ class ModelArguments:
     mm_perceiver_pretrained: Optional[str] = field(default=None)
     mm_qformer_depth: Optional[int] = field(default=3)
     mm_qformer_latents: Optional[int] = field(default=32)
+    mm_qformer_cross_attention_freq: int = field(default=1)
     mm_qformer_pretrained: Optional[str] = field(default=None)
+    mm_qformer_use_aux_loss: bool = field(default=False)
+    mm_qformer_aux_loss_weight: float = field(default=0.05)
+    mm_qformer_aux_dim: int = field(default=256)
+    mm_qformer_aux_alpha: float = field(default=5e-3)
+    mm_aux_batch_accum: int = field(default=32, metadata={"help": "Batch accumulation threshold for aux loss correlation computation."})
+    mm_tune_qformer_layers: Optional[str] = field(default=None, metadata={"help": "Which layers of Q-Former to tune. 'cross_attn_only' freezes SA and FFN."})
 
     rope_scaling_factor: Optional[float] = field(default=None)
     rope_scaling_type: Optional[str] = field(default=None)
@@ -148,11 +155,15 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_bias: str = "none"
     mm_projector_lr: Optional[float] = None
     mm_vision_tower_lr: Optional[float] = None
+    mm_vision_resampler_lr: Optional[float] = None
     group_by_varlen: bool = field(default=False)
     group_by_modality_length: bool = field(default=False)
     group_by_modality_length_auto: bool = field(default=False)
     auto_find_batch_size: bool = field(default=False)
     gradient_checkpointing: bool = field(default=True)
+    gradient_checkpointing_kwargs: Optional[dict] = field(
+        default_factory=lambda: {"use_reentrant": False}
+    )
     verbose_logging: bool = field(default=False)
     attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
 
@@ -230,6 +241,18 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
     return to_return
 
 
+def get_mm_adapter_state_with_buffers(model, keys_to_match):
+    """Collect parameters and buffers for mm_projector and vision_resampler (e.g. aux_rproj)."""
+    state = {}
+    for name, param in model.named_parameters():
+        if any(key_match in name for key_match in keys_to_match):
+            state[name] = maybe_zero_3(param, ignore_status=True).cpu()
+    for name, buf in model.named_buffers():
+        if any(key_match in name for key_match in keys_to_match):
+            state[name] = buf.detach().cpu().clone()
+    return state
+
+
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
@@ -265,7 +288,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(["embed_tokens", "embed_in"])
 
-        weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
+        weight_to_save = get_mm_adapter_state_with_buffers(trainer.model, keys_to_match)
         trainer.model.config.save_pretrained(output_dir)
 
         current_folder = output_dir.split("/")[-1]
@@ -275,6 +298,9 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
                 mm_projector_folder = os.path.join(parent_folder, "mm_projector")
                 os.makedirs(mm_projector_folder, exist_ok=True)
                 torch.save(weight_to_save, os.path.join(mm_projector_folder, f"{current_folder}.bin"))
+                # Also save into checkpoint dir so inference can load from ckpt_path/mm_projector.bin
+                os.makedirs(output_dir, exist_ok=True)
+                torch.save(weight_to_save, os.path.join(output_dir, f"mm_projector.bin"))
             else:
                 torch.save(weight_to_save, os.path.join(output_dir, f"mm_projector.bin"))
         return
@@ -640,15 +666,7 @@ def preprocess_llama3(
                 _input_id = safe_tokenizer_llama3(role) + nl_tokens * 2 + safe_tokenizer_llama3(sentence["value"]) + [eot_id]
             input_id += _input_id
             if role == "<|start_header_id|>user<|end_header_id|>":
-                # _target = [IGNORE_INDEX] * len(_input_id)
-                _target = []
-                for i in _input_id:
-                    if i in [start_header_id, end_header_id, nl_tokens[0], eot_id]:
-                        _target.append(i)
-                    else:
-                        _target.append(IGNORE_INDEX)
-                # _target = [IGNORE_INDEX if i != start_header_id or i != end_header_id or i != nl_tokens else i for i in _input_id]
-                # print(_target)
+                _target = [IGNORE_INDEX] * len(_input_id)
             elif role == "<|start_header_id|>assistant<|end_header_id|>":
                 _target = [start_header_id] + [IGNORE_INDEX] * len(safe_tokenizer_llama3("assistant")) + [end_header_id] + _input_id[len(safe_tokenizer_llama3(role)) : -1] + [eot_id]
             else:
@@ -1521,6 +1539,21 @@ def train(attn_implementation=None):
             if training_args.freeze_mm_vision_resampler:
                 for p in model.get_model().vision_resampler.parameters():
                     p.requires_grad = False
+            
+            # Partial freezing logic for Q-Former
+            model.config.mm_tune_qformer_layers = model_args.mm_tune_qformer_layers
+            if model_args.mm_tune_qformer_layers == "cross_attn_only" and not training_args.freeze_mm_vision_resampler:
+                rank0_print("Freezing Q-Former Self-Attention and FFN layers...")
+                for name, p in model.get_model().vision_resampler.named_parameters():
+                    # Unfreeze only cross-attention, query tokens, layer norms, and aux head
+                    if any(k in name for k in ["crossattention", "query_tokens", "ln_vision", "aux_proj"]):
+                        p.requires_grad = True
+                    else:
+                        p.requires_grad = False
+                
+                # Verify trainable parameters
+                trainable_names = [n for n, p in model.get_model().vision_resampler.named_parameters() if p.requires_grad]
+                rank0_print(f"Trainable Q-Former params: {trainable_names}")
 
             model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower
             if model_args.unfreeze_mm_vision_tower:
@@ -1563,6 +1596,11 @@ def train(attn_implementation=None):
         model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_projector_lr = training_args.mm_projector_lr
         model.config.mm_vision_tower_lr = training_args.mm_vision_tower_lr
+        model.config.mm_qformer_use_aux_loss = model_args.mm_qformer_use_aux_loss
+        model.config.mm_qformer_aux_loss_weight = model_args.mm_qformer_aux_loss_weight
+        model.config.mm_qformer_aux_dim = model_args.mm_qformer_aux_dim
+        model.config.mm_qformer_aux_alpha = model_args.mm_qformer_aux_alpha
+        model.config.mm_aux_batch_accum = model_args.mm_aux_batch_accum
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
@@ -1583,6 +1621,13 @@ def train(attn_implementation=None):
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+
+    # Safety net: force non-reentrant gradient checkpointing AFTER the Trainer
+    # has been created (Trainer.__init__ may re-enable checkpointing with defaults).
+    if training_args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
 
     # Resume only if a proper trainer_state.json exists in the latest checkpoint.
     checkpoints = sorted(

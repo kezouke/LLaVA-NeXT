@@ -264,7 +264,7 @@ class Conversation:
         return ret
 
     def copy(self):
-        return Conversation(system=self.system, roles=self.roles, messages=[[x, y] for x, y in self.messages], offset=self.offset, sep_style=self.sep_style, sep=self.sep, sep2=self.sep2, version=self.version)
+        return Conversation(system=self.system, roles=self.roles, messages=[[x, y] for x, y in self.messages], offset=self.offset, sep_style=self.sep_style, sep=self.sep, sep2=self.sep2, version=self.version, tokenizer_id=self.tokenizer_id, tokenizer=self.tokenizer, stop_str=self.stop_str, stop_token_ids=self.stop_token_ids)
 
     def dict(self):
         if len(self.get_images()) > 0:
@@ -355,7 +355,7 @@ conv_llava_llama_2 = Conversation(
 
 conv_llava_llama_3 = Conversation(
     system="You are a helpful language and vision assistant. " "You are able to understand the visual content that the user provides, " "and assist the user with a variety of tasks using natural language.",
-    roles=("<|start_header_id|>user", "<|start_header_id|>assistant"),
+    roles=("user", "assistant"),
     version="llama_v3",
     messages=[],
     offset=0,

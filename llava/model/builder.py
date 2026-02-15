@@ -157,7 +157,8 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 raise ValueError(f"Model {model_name} not supported")
 
             mm_projector_weights = torch.load(os.path.join(model_path, "mm_projector.bin"), map_location="cpu")
-            mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
+            load_dtype = kwargs.get("torch_dtype", torch.float16)
+            mm_projector_weights = {k: v.to(load_dtype) for k, v in mm_projector_weights.items()}
             
             # Resize embeddings if necessary before loading weights
             if "model.embed_tokens.weight" in mm_projector_weights:

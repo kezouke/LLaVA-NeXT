@@ -154,11 +154,15 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_bias: str = "none"
     mm_projector_lr: Optional[float] = None
     mm_vision_tower_lr: Optional[float] = None
+    mm_vision_resampler_lr: Optional[float] = None
     group_by_varlen: bool = field(default=False)
     group_by_modality_length: bool = field(default=False)
     group_by_modality_length_auto: bool = field(default=False)
     auto_find_batch_size: bool = field(default=False)
     gradient_checkpointing: bool = field(default=True)
+    gradient_checkpointing_kwargs: Optional[dict] = field(
+        default_factory=lambda: {"use_reentrant": False}
+    )
     verbose_logging: bool = field(default=False)
     attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
     dpo_alpha: float = field(default=1.0)

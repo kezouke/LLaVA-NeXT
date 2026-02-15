@@ -191,7 +191,21 @@ class LlavaMetaForCausalLM(ABC):
 
     def encode_images(self, images):
         image_features = self.get_model().get_vision_tower()(images)
-        image_features = self.get_model().vision_resampler(image_features, images=images)
+        resampler_output = self.get_model().vision_resampler(image_features, images=images)
+        
+        # Handle Q-Former auxiliary loss return
+        if isinstance(resampler_output, tuple):
+            image_features, aux_loss = resampler_output
+            # Store aux_loss in the model for retrieval in forward()
+            # Note: We accumulate if multiple images are processed in a batch, though typically encode_images is called once
+            if hasattr(self.get_model(), "aux_loss"):
+                if self.get_model().aux_loss is None:
+                    self.get_model().aux_loss = aux_loss
+                else:
+                    self.get_model().aux_loss += aux_loss
+        else:
+            image_features = resampler_output
+            
         image_features = self.get_model().mm_projector(image_features)
         return image_features
 
@@ -203,7 +217,20 @@ class LlavaMetaForCausalLM(ABC):
         for idx, feat in enumerate(per_videos_or_images_features):
             if idx in video_idx_in_batch:
                 feat = self.get_2dPool(feat)
-            feat = self.get_model().vision_resampler(feat, images=videos_or_images)
+            
+            resampler_output = self.get_model().vision_resampler(feat, images=videos_or_images)
+            
+            # Handle Q-Former auxiliary loss return
+            if isinstance(resampler_output, tuple):
+                feat, aux_loss = resampler_output
+                if hasattr(self.get_model(), "aux_loss"):
+                    if self.get_model().aux_loss is None:
+                        self.get_model().aux_loss = aux_loss
+                    else:
+                        self.get_model().aux_loss += aux_loss
+            else:
+                feat = resampler_output
+                
             feat = self.get_model().mm_projector(feat)
             all_videos_or_images_features.append(feat)
         return all_videos_or_images_features

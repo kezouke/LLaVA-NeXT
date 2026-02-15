@@ -48,6 +48,18 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
     return to_return
 
 
+def get_mm_adapter_state_with_buffers(model, keys_to_match):
+    """Collect parameters and buffers for mm_projector and vision_resampler (e.g. aux_rproj)."""
+    state = {}
+    for name, param in model.named_parameters():
+        if any(key_match in name for key_match in keys_to_match):
+            state[name] = maybe_zero_3(param, ignore_status=True, name=name).cpu()
+    for name, buf in model.named_buffers():
+        if any(key_match in name for key_match in keys_to_match):
+            state[name] = buf.detach().cpu().clone()
+    return state
+
+
 def split_to_even_chunks(indices, lengths, num_chunks):
     """
     Split a list of indices into `chunks` chunks of roughly equal lengths.
@@ -239,6 +251,19 @@ class LengthGroupedSampler(Sampler):
 
 class LLaVATrainer(Trainer):
 
+    def _load_optimizer_and_scheduler(self, resume_from_checkpoint):
+        """Load optimizer/scheduler from checkpoint; on mismatch (e.g. different trainable params), skip and start fresh."""
+        try:
+            super()._load_optimizer_and_scheduler(resume_from_checkpoint)
+        except ValueError as e:
+            if "parameter group" in str(e) and "doesn't match" in str(e):
+                rank0_print(
+                    f"Resume: skipping optimizer/scheduler load (state mismatch, e.g. different model config): {e}. "
+                    "Training will continue with fresh optimizer/scheduler."
+                )
+            else:
+                raise
+
     def create_accelerator_and_postprocess(self):
         grad_acc_kwargs = {"num_steps": self.args.gradient_accumulation_steps}
         grad_acc_kwargs["sync_with_dataloader"] = False
@@ -382,6 +407,8 @@ class LLaVATrainer(Trainer):
                 lr_mapper["mm_projector"] = self.args.mm_projector_lr
             if self.args.mm_vision_tower_lr is not None:
                 lr_mapper["vision_tower"] = self.args.mm_vision_tower_lr
+            if getattr(self.args, "mm_vision_resampler_lr", None) is not None:
+                lr_mapper["vision_resampler"] = self.args.mm_vision_resampler_lr
             if len(lr_mapper) > 0:
                 special_lr_parameters = [name for name, _ in opt_model.named_parameters() if any(module_keyword in name for module_keyword in lr_mapper)]
                 optimizer_grouped_parameters = [
@@ -457,7 +484,7 @@ class LLaVATrainer(Trainer):
             if getattr(self.args, "use_im_start_end", False):
                 keys_to_match.extend(["embed_tokens", "embed_in"])
 
-            weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
+            weight_to_save = get_mm_adapter_state_with_buffers(self.model, keys_to_match)
 
             if self.args.local_rank == 0 or self.args.local_rank == -1:
                 self.model.config.save_pretrained(output_dir)
@@ -505,7 +532,7 @@ class LLaVADPOTrainer(DPOTrainer):
             if getattr(self.args, "use_im_start_end", False):
                 keys_to_match.extend(["embed_tokens", "embed_in"])
 
-            weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
+            weight_to_save = get_mm_adapter_state_with_buffers(self.model, keys_to_match)
 
             if self.args.local_rank == 0 or self.args.local_rank == -1:
                 self.model.config.save_pretrained(output_dir)

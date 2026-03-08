@@ -1280,7 +1280,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
             cache_dir=training_args.cache_dir,
             attn_implementation=training_args.attn_implementation,
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-            low_cpu_mem_usage=False,
+            low_cpu_mem_usage=True,
             **customized_kwargs,
         )
     elif model_args.vision_tower is not None:
@@ -1290,7 +1290,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 cache_dir=training_args.cache_dir,
                 attn_implementation=training_args.attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                low_cpu_mem_usage=False,
+                low_cpu_mem_usage=True,
                 **customized_kwargs,
             )
             from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
@@ -1302,7 +1302,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 cache_dir=training_args.cache_dir,
                 attn_implementation=training_args.attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                low_cpu_mem_usage=False,
+                low_cpu_mem_usage=True,
                 **customized_kwargs,
             )
         elif (
@@ -1318,7 +1318,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 cache_dir=training_args.cache_dir,
                 attn_implementation=training_args.attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                low_cpu_mem_usage=False,
+                low_cpu_mem_usage=True,
                 **customized_kwargs,
             )
         elif "qwen" in model_args.model_name_or_path.lower() or "quyen" in model_args.model_name_or_path.lower():
@@ -1328,7 +1328,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                     cache_dir=training_args.cache_dir,
                     attn_implementation=training_args.attn_implementation,
                     torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                    low_cpu_mem_usage=False,
+                    low_cpu_mem_usage=True,
                     **customized_kwargs,
                 )
                 from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeSparseMoeBlock
@@ -1340,7 +1340,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                     cache_dir=training_args.cache_dir,
                     attn_implementation=training_args.attn_implementation,
                     torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                    low_cpu_mem_usage=False,
+                    low_cpu_mem_usage=True,
                     **customized_kwargs,
                 )
         elif "gemma" in model_args.model_name_or_path.lower():
@@ -1349,7 +1349,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 cache_dir=training_args.cache_dir,
                 attn_implementation=training_args.attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                low_cpu_mem_usage=False,
+                low_cpu_mem_usage=True,
                 **customized_kwargs,
             )
         else:
@@ -1360,7 +1360,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
             cache_dir=training_args.cache_dir,
             attn_implementation=training_args.attn_implementation,
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-            low_cpu_mem_usage=False,
+            low_cpu_mem_usage=True,
             **customized_kwargs,
         )
     return model

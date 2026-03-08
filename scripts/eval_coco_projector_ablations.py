@@ -18,7 +18,15 @@ from llava.conversation import conv_templates
 
 # Default Configurations
 DEFAULT_CHECKPOINT_ROOT = "./checkpoints"
-DEFAULT_PROJECTORS = ["linear", "mlp2x", "mlp2x-res2x", "pooler"]
+DEFAULT_PROJECTORS = [
+    "linear",
+    "mlp2x",
+    "mlp2x-res2x",
+    "pooler",
+    "mlp_1layer_8m",
+    "mlp_1layer_12m",
+    "mlp_2x_narrow_15m"
+]
 
 def get_checkpoint_path(checkpoint_root, projector_slug, tag):
     if tag:

@@ -66,6 +66,46 @@ class LowRankProjector(nn.Module):
         return {"mm_projector_type": "low_rank", "mm_low_rank_rank": self.rank}
 
 
+class IntermediateMLPProjector(nn.Module):
+    """Intermediate capacity MLP projector for capacity threshold experiments.
+
+    Supports three variants:
+    - mlp_1layer_8m: ~10.5M params (hidden_dim=2048)
+    - mlp_1layer_12m: ~13.1M params (hidden_dim=2560)
+    - mlp_2x_narrow_15m: ~15.7M params (hidden_dim=3072)
+    """
+
+    def __init__(self, config, hidden_dim=2048):
+        super().__init__()
+        self._config = config
+        self.hidden_dim = hidden_dim
+        self.mm_hidden_size = config.mm_hidden_size
+        self.output_size = config.hidden_size
+
+        # Two-layer MLP with configurable hidden dimension
+        self.fc1 = nn.Linear(self.mm_hidden_size, self.hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(self.hidden_dim, self.output_size)
+
+        # Calculate actual parameter count
+        self.param_count = (self.mm_hidden_size * self.hidden_dim +
+                           self.hidden_dim * self.output_size)
+
+    def forward(self, x, *args, **kwargs):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        return x
+
+    @property
+    def config(self):
+        return {
+            "mm_projector_type": f"intermediate_mlp_{self.hidden_dim}",
+            "hidden_dim": self.hidden_dim,
+            "param_count": self.param_count
+        }
+
+
 def build_vision_projector(config, delay_load=False, **kwargs):
     projector_type = getattr(config, "mm_projector_type", "linear")
 
@@ -77,6 +117,16 @@ def build_vision_projector(config, delay_load=False, **kwargs):
 
     if projector_type == "low_rank":
         return LowRankProjector(config, kwargs.get("vision_cfg"))
+
+    # Intermediate capacity projectors for capacity threshold experiments
+    if projector_type == "mlp_1layer_8m":
+        return IntermediateMLPProjector(config, hidden_dim=2048)
+
+    if projector_type == "mlp_1layer_12m":
+        return IntermediateMLPProjector(config, hidden_dim=2560)
+
+    if projector_type == "mlp_2x_narrow_15m":
+        return IntermediateMLPProjector(config, hidden_dim=3072)
 
     mlp_gelu_match = re.match(r"^mlp(\d+)x_gelu$", projector_type)
     if mlp_gelu_match:

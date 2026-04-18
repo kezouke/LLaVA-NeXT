@@ -132,10 +132,8 @@ def evaluate_coco(result_file, annotation_file):
     # create coco_eval object by taking coco and coco_result
     coco_eval = COCOEvalCap(coco, coco_result)
 
-    # evaluate on a subset of images by setting
+    # evaluate on full split (restriction removed per original comment)
     # coco_eval.params['image_id'] = coco_result.getImgIds()
-    # please remove this line when evaluating the full validation set
-    coco_eval.params['image_id'] = coco_result.getImgIds()
 
     # evaluate results
     # SPICE can take a while, so maybe disable it for quick checks if needed

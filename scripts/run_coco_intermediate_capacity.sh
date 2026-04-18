@@ -37,7 +37,7 @@ SAVE_TOTAL="${SAVE_TOTAL:-2}"
 PROJ_LR="${PROJ_LR:-2e-4}"
 TF32="${TF32:-true}"
 NUM_WORKERS="${NUM_WORKERS:-16}"
-# Note: EXPLICITLY disable gradient_checkpointing (default is True in TrainingArguments!)
+# Note: EXPLICITLY enable gradient_checkpointing (non-reentrant; required for frozen-backbone token injection)
 EXTRA_ARGS="${EXTRA_ARGS:- --version plain --evaluation_strategy no --save_strategy steps --report_to none --gradient_checkpointing True --attn_implementation flash_attention_2}"
 
 # Sanity checks
